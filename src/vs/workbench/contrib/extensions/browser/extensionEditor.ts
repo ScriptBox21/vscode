@@ -14,7 +14,7 @@ import { Action, IAction } from 'vs/base/common/actions';
 import { isPromiseCanceledError } from 'vs/base/common/errors';
 import { dispose, toDisposable, Disposable, DisposableStore, IDisposable } from 'vs/base/common/lifecycle';
 import { domEvent } from 'vs/base/browser/event';
-import { append, $, finalHandler, join, hide, show, addDisposableListener, EventType } from 'vs/base/browser/dom';
+import { append, $, finalHandler, join, hide, show, addDisposableListener, EventType, setParentFlowTo } from 'vs/base/browser/dom';
 import { EditorPane } from 'vs/workbench/browser/parts/editor/editorPane';
 import { IViewletService } from 'vs/workbench/services/viewlet/browser/viewlet';
 import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
@@ -31,7 +31,7 @@ import {
 	UpdateAction, ReloadAction, MaliciousStatusLabelAction, EnableDropDownAction, DisableDropDownAction, StatusLabelAction, SetFileIconThemeAction, SetColorThemeAction,
 	RemoteInstallAction, ExtensionToolTipAction, SystemDisabledWarningAction, LocalInstallAction, ToggleSyncExtensionAction, SetProductIconThemeAction,
 	ActionWithDropDownAction, InstallDropdownAction, InstallingLabelAction, UninstallAction, ExtensionActionWithDropdownActionViewItem, ExtensionDropDownAction,
-	InstallAnotherVersionAction, ExtensionEditorManageExtensionAction
+	InstallAnotherVersionAction, ExtensionEditorManageExtensionAction, WebInstallAction
 } from 'vs/workbench/contrib/extensions/browser/extensionsActions';
 import { IKeybindingService } from 'vs/platform/keybinding/common/keybinding';
 import { DomScrollableElement } from 'vs/base/browser/ui/scrollbar/scrollableElement';
@@ -43,7 +43,7 @@ import { IEditorService } from 'vs/workbench/services/editor/common/editorServic
 import { KeybindingWeight } from 'vs/platform/keybinding/common/keybindingsRegistry';
 import { Color } from 'vs/base/common/color';
 import { INotificationService } from 'vs/platform/notification/common/notification';
-import { CancellationToken } from 'vs/base/common/cancellation';
+import { CancellationToken, CancellationTokenSource } from 'vs/base/common/cancellation';
 import { ExtensionsTree, ExtensionData, ExtensionsGridView, getExtensions } from 'vs/workbench/contrib/extensions/browser/extensionsViewer';
 import { ShowCurrentReleaseNotesActionId } from 'vs/workbench/contrib/update/common/update';
 import { KeybindingParser } from 'vs/base/common/keybindingParser';
@@ -65,22 +65,14 @@ import { generateTokensCSSForColorMap } from 'vs/editor/common/modes/supports/to
 import { editorBackground } from 'vs/platform/theme/common/colorRegistry';
 import { registerAction2, Action2 } from 'vs/platform/actions/common/actions';
 import { IContextMenuService } from 'vs/platform/contextview/browser/contextView';
+import { insane } from 'vs/base/common/insane/insane';
 
 function removeEmbeddedSVGs(documentContent: string): string {
-	const newDocument = new DOMParser().parseFromString(documentContent, 'text/html');
-
-	// remove all inline svgs
-	const allSVGs = newDocument.documentElement.querySelectorAll('svg');
-	if (allSVGs) {
-		for (let i = 0; i < allSVGs.length; i++) {
-			const svg = allSVGs[i];
-			if (svg.parentNode) {
-				svg.parentNode.removeChild(allSVGs[i]);
-			}
+	return insane(documentContent, {
+		filter(token: { tag: string, attrs: { readonly [key: string]: string } }): boolean {
+			return token.tag !== 'svg';
 		}
-	}
-
-	return newDocument.documentElement.outerHTML;
+	});
 }
 
 class NavBar extends Disposable {
@@ -169,6 +161,11 @@ interface IExtensionEditorTemplate {
 	header: HTMLElement;
 }
 
+const enum WebviewIndex {
+	Readme,
+	Changelog
+}
+
 export class ExtensionEditor extends EditorPane {
 
 	static readonly ID: string = 'workbench.editor.extension';
@@ -178,6 +175,12 @@ export class ExtensionEditor extends EditorPane {
 	private extensionReadme: Cache<string> | null;
 	private extensionChangelog: Cache<string> | null;
 	private extensionManifest: Cache<IExtensionManifest | null> | null;
+
+	// Some action bar items use a webview whose vertical scroll position we track in this map
+	private initialScrollProgress: Map<WebviewIndex, number> = new Map();
+
+	// Spot when an ExtensionEditor instance gets reused for a different extension, in which case the vertical scroll positions must be zeroed
+	private currentIdentifier: string = '';
 
 	private layoutParticipants: ILayoutParticipant[] = [];
 	private readonly contentDisposables = this._register(new DisposableStore());
@@ -284,6 +287,7 @@ export class ExtensionEditor extends EditorPane {
 		const navbar = new NavBar(body);
 
 		const content = append(body, $('.content'));
+		content.id = generateUuid(); // An id is needed for the webview parent flow to
 
 		this.template = {
 			builtin,
@@ -331,11 +335,14 @@ export class ExtensionEditor extends EditorPane {
 	}
 
 	private async updateTemplate(input: ExtensionsInput, template: IExtensionEditorTemplate, preserveFocus: boolean): Promise<void> {
-		const runningExtensions = await this.extensionService.getExtensions();
-
 		this.activeElement = null;
 		this.editorLoadComplete = false;
 		const extension = input.extension;
+
+		if (this.currentIdentifier !== extension.identifier.id) {
+			this.initialScrollProgress.clear();
+			this.currentIdentifier = extension.identifier.id;
+		}
 
 		this.transientDisposables.clear();
 
@@ -420,9 +427,10 @@ export class ExtensionEditor extends EditorPane {
 			this.instantiationService.createInstance(SetProductIconThemeAction, await this.workbenchThemeService.getProductIconThemes()),
 
 			this.instantiationService.createInstance(EnableDropDownAction),
-			this.instantiationService.createInstance(DisableDropDownAction, runningExtensions),
+			this.instantiationService.createInstance(DisableDropDownAction),
 			this.instantiationService.createInstance(RemoteInstallAction, false),
 			this.instantiationService.createInstance(LocalInstallAction),
+			this.instantiationService.createInstance(WebInstallAction),
 			combinedInstallAction,
 			this.instantiationService.createInstance(InstallingLabelAction),
 			this.instantiationService.createInstance(ActionWithDropDownAction, 'extensions.uninstall', UninstallAction.UninstallLabel, [
@@ -538,8 +546,13 @@ export class ExtensionEditor extends EditorPane {
 		template.content.innerText = '';
 		this.activeElement = null;
 		if (id) {
-			this.open(id, extension, template)
+			const cts = new CancellationTokenSource();
+			this.contentDisposables.add(toDisposable(() => cts.dispose(true)));
+			this.open(id, extension, template, cts.token)
 				.then(activeElement => {
+					if (cts.token.isCancellationRequested) {
+						return;
+					}
 					this.activeElement = activeElement;
 					if (focus) {
 						this.focus();
@@ -548,29 +561,41 @@ export class ExtensionEditor extends EditorPane {
 		}
 	}
 
-	private open(id: string, extension: IExtension, template: IExtensionEditorTemplate): Promise<IActiveElement | null> {
+	private open(id: string, extension: IExtension, template: IExtensionEditorTemplate, token: CancellationToken): Promise<IActiveElement | null> {
 		switch (id) {
-			case NavbarSection.Readme: return this.openReadme(template);
-			case NavbarSection.Contributions: return this.openContributions(template);
-			case NavbarSection.Changelog: return this.openChangelog(template);
-			case NavbarSection.Dependencies: return this.openDependencies(extension, template);
+			case NavbarSection.Readme: return this.openReadme(template, token);
+			case NavbarSection.Contributions: return this.openContributions(template, token);
+			case NavbarSection.Changelog: return this.openChangelog(template, token);
+			case NavbarSection.Dependencies: return this.openDependencies(extension, template, token);
 		}
 		return Promise.resolve(null);
 	}
 
-	private async openMarkdown(cacheResult: CacheResult<string>, noContentCopy: string, template: IExtensionEditorTemplate): Promise<IActiveElement> {
+	private async openMarkdown(cacheResult: CacheResult<string>, noContentCopy: string, template: IExtensionEditorTemplate, webviewIndex: WebviewIndex, token: CancellationToken): Promise<IActiveElement | null> {
 		try {
 			const body = await this.renderMarkdown(cacheResult, template);
+			if (token.isCancellationRequested) {
+				return Promise.resolve(null);
+			}
 
 			const webview = this.contentDisposables.add(this.webviewService.createWebviewOverlay('extensionEditor', {
 				enableFindWidget: true,
+				tryRestoreScrollPosition: true,
 			}, {}, undefined));
 
+			webview.initialScrollProgress = this.initialScrollProgress.get(webviewIndex) || 0;
+
 			webview.claim(this, this.scopedContextKeyService);
+			setParentFlowTo(webview.container, template.content);
 			webview.layoutWebviewOverElement(template.content);
+
 			webview.html = body;
+			webview.claim(this, undefined);
 
 			this.contentDisposables.add(webview.onDidFocus(() => this.fireOnDidFocus()));
+
+			this.contentDisposables.add(webview.onDidScroll(() => this.initialScrollProgress.set(webviewIndex, webview.initialScrollProgress)));
+
 			const removeLayoutParticipant = arrays.insert(this.layoutParticipants, {
 				layout: () => {
 					webview.layoutWebviewOverElement(template.content);
@@ -612,8 +637,8 @@ export class ExtensionEditor extends EditorPane {
 	private async renderMarkdown(cacheResult: CacheResult<string>, template: IExtensionEditorTemplate) {
 		const contents = await this.loadContents(() => cacheResult, template);
 		const content = await renderMarkdownDocument(contents, this.extensionService, this.modeService);
-		const documentContent = await this.renderBody(content);
-		return removeEmbeddedSVGs(documentContent);
+		const sanitizedContent = removeEmbeddedSVGs(content);
+		return await this.renderBody(sanitizedContent);
 	}
 
 	private async renderBody(body: string): Promise<string> {
@@ -699,9 +724,16 @@ export class ExtensionEditor extends EditorPane {
 					}
 
 					code {
+						font-family: "SF Mono", Monaco, Menlo, Consolas, "Ubuntu Mono", "Liberation Mono", "DejaVu Sans Mono", "Courier New", monospace;
+						font-size: 14px;
+						line-height: 19px;
+					}
+
+					pre code {
 						font-family: var(--vscode-editor-font-family);
 						font-weight: var(--vscode-editor-font-weight);
 						font-size: var(--vscode-editor-font-size);
+						line-height: 1.5;
 					}
 
 					code > div {
@@ -808,15 +840,19 @@ export class ExtensionEditor extends EditorPane {
 		</html>`;
 	}
 
-	private async openReadme(template: IExtensionEditorTemplate): Promise<IActiveElement> {
+	private async openReadme(template: IExtensionEditorTemplate, token: CancellationToken): Promise<IActiveElement | null> {
 		const manifest = await this.extensionManifest!.get().promise;
 		if (manifest && manifest.extensionPack && manifest.extensionPack.length) {
-			return this.openExtensionPackReadme(manifest, template);
+			return this.openExtensionPackReadme(manifest, template, token);
 		}
-		return this.openMarkdown(this.extensionReadme!.get(), localize('noReadme', "No README available."), template);
+		return this.openMarkdown(this.extensionReadme!.get(), localize('noReadme', "No README available."), template, WebviewIndex.Readme, token);
 	}
 
-	private async openExtensionPackReadme(manifest: IExtensionManifest, template: IExtensionEditorTemplate): Promise<IActiveElement> {
+	private async openExtensionPackReadme(manifest: IExtensionManifest, template: IExtensionEditorTemplate, token: CancellationToken): Promise<IActiveElement | null> {
+		if (token.isCancellationRequested) {
+			return Promise.resolve(null);
+		}
+
 		const extensionPackReadme = append(template.content, $('div', { class: 'extension-pack-readme' }));
 		extensionPackReadme.style.margin = '0 auto';
 		extensionPackReadme.style.maxWidth = '882px';
@@ -840,21 +876,25 @@ export class ExtensionEditor extends EditorPane {
 		const readmeContent = append(extensionPackReadme, $('div.readme-content'));
 
 		await Promise.all([
-			this.renderExtensionPack(manifest, extensionPackContent),
-			this.openMarkdown(this.extensionReadme!.get(), localize('noReadme', "No README available."), { ...template, ...{ content: readmeContent } }),
+			this.renderExtensionPack(manifest, extensionPackContent, token),
+			this.openMarkdown(this.extensionReadme!.get(), localize('noReadme', "No README available."), { ...template, ...{ content: readmeContent } }, WebviewIndex.Readme, token),
 		]);
 
 		return { focus: () => extensionPackContent.focus() };
 	}
 
-	private openChangelog(template: IExtensionEditorTemplate): Promise<IActiveElement> {
-		return this.openMarkdown(this.extensionChangelog!.get(), localize('noChangelog', "No Changelog available."), template);
+	private openChangelog(template: IExtensionEditorTemplate, token: CancellationToken): Promise<IActiveElement | null> {
+		return this.openMarkdown(this.extensionChangelog!.get(), localize('noChangelog', "No Changelog available."), template, WebviewIndex.Changelog, token);
 	}
 
-	private openContributions(template: IExtensionEditorTemplate): Promise<IActiveElement> {
+	private openContributions(template: IExtensionEditorTemplate, token: CancellationToken): Promise<IActiveElement | null> {
 		const content = $('div', { class: 'subcontent', tabindex: '0' });
 		return this.loadContents(() => this.extensionManifest!.get(), template)
 			.then(manifest => {
+				if (token.isCancellationRequested) {
+					return null;
+				}
+
 				if (!manifest) {
 					return content;
 				}
@@ -895,13 +935,21 @@ export class ExtensionEditor extends EditorPane {
 				}
 				return content;
 			}, () => {
+				if (token.isCancellationRequested) {
+					return null;
+				}
+
 				append(content, $('p.nocontent')).textContent = localize('noContributions', "No Contributions");
 				append(template.content, content);
 				return content;
 			});
 	}
 
-	private openDependencies(extension: IExtension, template: IExtensionEditorTemplate): Promise<IActiveElement> {
+	private openDependencies(extension: IExtension, template: IExtensionEditorTemplate, token: CancellationToken): Promise<IActiveElement | null> {
+		if (token.isCancellationRequested) {
+			return Promise.resolve(null);
+		}
+
 		if (arrays.isFalsyOrEmpty(extension.dependencies)) {
 			append(template.content, $('p.nocontent')).textContent = localize('noDependencies', "No Dependencies");
 			return Promise.resolve(template.content);
@@ -930,7 +978,11 @@ export class ExtensionEditor extends EditorPane {
 		return Promise.resolve({ focus() { dependenciesTree.domFocus(); } });
 	}
 
-	private async renderExtensionPack(manifest: IExtensionManifest, parent: HTMLElement): Promise<void> {
+	private async renderExtensionPack(manifest: IExtensionManifest, parent: HTMLElement, token: CancellationToken): Promise<void> {
+		if (token.isCancellationRequested) {
+			return;
+		}
+
 		const content = $('div', { class: 'subcontent' });
 		const scrollableContent = new DomScrollableElement(content, { useShadows: false });
 		append(parent, scrollableContent.getDomNode());
@@ -1403,7 +1455,7 @@ export class ExtensionEditor extends EditorPane {
 
 		const details = $('details', { open: true, ontoggle: onDetailsToggle },
 			$('summary', { tabindex: '0' }, localize('activation events', "Activation Events ({0})", activationEvents.length)),
-			$('ul', undefined, ...activationEvents.map(activationEvent => $('li', undefined, activationEvent)))
+			$('ul', undefined, ...activationEvents.map(activationEvent => $('li', undefined, $('code', undefined, activationEvent))))
 		);
 
 		append(container, details);

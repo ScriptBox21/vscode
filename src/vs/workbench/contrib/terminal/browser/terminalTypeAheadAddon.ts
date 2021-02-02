@@ -22,8 +22,7 @@ const HIDE_CURSOR = `${CSI}?25l`;
 const DELETE_CHAR = `${CSI}X`;
 const DELETE_REST_OF_LINE = `${CSI}K`;
 const CSI_STYLE_RE = /^\x1b\[[0-9;]*m/;
-const CSI_MOVE_RE = /^\x1b\[([0-9]*)(;[35])?O?([DC])/;
-const PASSWORD_INPUT_RE = /(?:\W|^)(?:pat|token|password|passphrase|passwd)(\W.*:|:)/i;
+const CSI_MOVE_RE = /^\x1b\[?([0-9]*)(;[35])?O?([DC])/;
 const NOT_WORD_RE = /[^a-z0-9]/i;
 
 const statsBufferSize = 24;
@@ -202,8 +201,10 @@ export interface IPrediction {
 
 	/**
 	 * Returns whether the given input is one expected by this prediction.
+	 * @param input reader for the input the PTY is giving
+	 * @param lookBehind the last successfully-made prediction, if any
 	 */
-	matches(input: StringReader): MatchResult;
+	matches(input: StringReader, lookBehind?: IPrediction): MatchResult;
 }
 
 class StringReader {
@@ -324,22 +325,24 @@ class HardBoundary implements IPrediction {
  * through its `matches` request.
  */
 class TentativeBoundary implements IPrediction {
-	private expected?: Cursor;
-	constructor(private readonly inner: IPrediction) { }
+	private appliedCursor?: Cursor;
+
+	constructor(public readonly inner: IPrediction) { }
 
 	public apply(buffer: IBuffer, cursor: Cursor) {
-		this.expected = cursor.clone();
-		this.inner.apply(buffer, this.expected);
+		this.appliedCursor = cursor.clone();
+		this.inner.apply(buffer, this.appliedCursor);
 		return '';
 	}
 
-	public rollback() {
+	public rollback(cursor: Cursor) {
+		this.inner.rollback(cursor.clone());
 		return '';
 	}
 
 	public rollForwards(cursor: Cursor, withInput: string) {
-		if (this.expected) {
-			cursor.moveTo(this.expected);
+		if (this.appliedCursor) {
+			cursor.moveTo(this.appliedCursor);
 		}
 
 		return withInput;
@@ -350,13 +353,16 @@ class TentativeBoundary implements IPrediction {
 	}
 }
 
+export const isTenativeCharacterPrediction = (p: unknown): p is (TentativeBoundary & { inner: CharacterPrediction }) =>
+	p instanceof TentativeBoundary && p.inner instanceof CharacterPrediction;
+
 /**
  * Prediction for a single alphanumeric character.
  */
 class CharacterPrediction implements IPrediction {
 	public readonly affectsStyle = true;
 
-	protected appliedAt?: {
+	public appliedAt?: {
 		pos: ICoordinate;
 		oldAttributes: string;
 		oldChar: string;
@@ -393,7 +399,7 @@ class CharacterPrediction implements IPrediction {
 		return cursor.clone().moveTo(this.appliedAt.pos) + input;
 	}
 
-	public matches(input: StringReader) {
+	public matches(input: StringReader, lookBehind?: IPrediction) {
 		let startIndex = input.index;
 
 		// remove any styling CSI before checking the char
@@ -405,6 +411,14 @@ class CharacterPrediction implements IPrediction {
 
 		if (input.eatChar(this.char)) {
 			return MatchResult.Success;
+		}
+
+		if (lookBehind instanceof CharacterPrediction) {
+			// see #112842
+			const sillyZshOutcome = input.eatGradually(`\b${lookBehind.char}${this.char}`);
+			if (sillyZshOutcome !== MatchResult.Failure) {
+				return sillyZshOutcome;
+			}
 		}
 
 		input.index = startIndex;
@@ -689,10 +703,19 @@ export class PredictionTimeline {
 	private currentGen = 0;
 
 	/**
-	 * Cursor position -- kept outside the buffer since it can be ahead if
-	 * typing swiftly.
+	 * Current cursor position -- kept outside the buffer since it can be ahead
+	 * if typing swiftly. The position of the cursor that the user is currently
+	 * looking at on their screen (or will be looking at after all pending writes
+	 * are flushed.)
 	 */
-	private cursor: Cursor | undefined;
+	private _physicalCursor: Cursor | undefined;
+
+	/**
+	 * Cursor position taking into account all (possibly not-yet-applied)
+	 * predictions. A new prediction inserted, if applied, will be applied at
+	 * the position of the tentative cursor.
+	 */
+	private _tenativeCursor: Cursor | undefined;
 
 	/**
 	 * Previously sent data that was buffered and should be prepended to the
@@ -706,6 +729,11 @@ export class PredictionTimeline {
 	 * never be adjusted.
 	 */
 	private showPredictions = false;
+
+	/**
+	 * The last successfully-made prediction.
+	 */
+	private lookBehind?: IPrediction;
 
 	private readonly addedEmitter = new Emitter<IPrediction>();
 	public readonly onPredictionAdded = this.addedEmitter.event;
@@ -743,11 +771,11 @@ export class PredictionTimeline {
 
 		const toApply = this.currentGenerationPredictions;
 		if (show) {
-			this.cursor = undefined;
+			this.clearCursor();
 			this.style.expectIncomingStyle(toApply.reduce((count, p) => p.affectsStyle ? count + 1 : count, 0));
-			this.terminal.write(toApply.map(p => p.apply(buffer, this.getCursor(buffer))).join(''));
+			this.terminal.write(toApply.map(p => p.apply(buffer, this.physicalCursor(buffer))).join(''));
 		} else {
-			this.terminal.write(toApply.reverse().map(p => p.rollback(this.getCursor(buffer))).join(''));
+			this.terminal.write(toApply.reverse().map(p => p.rollback(this.physicalCursor(buffer))).join(''));
 		}
 	}
 
@@ -758,7 +786,7 @@ export class PredictionTimeline {
 		const buffer = this.getActiveBuffer();
 		if (this.showPredictions && buffer) {
 			this.terminal.write(this.currentGenerationPredictions.reverse()
-				.map(p => p.rollback(this.getCursor(buffer))).join(''));
+				.map(p => p.rollback(this.physicalCursor(buffer))).join(''));
 		}
 
 		this.expected = [];
@@ -775,13 +803,13 @@ export class PredictionTimeline {
 		}
 
 		if (!this.expected.length) {
-			this.cursor = undefined;
+			this.clearPredictionState();
 			return input;
 		}
 
 		const buffer = this.getActiveBuffer();
 		if (!buffer) {
-			this.cursor = undefined;
+			this.clearPredictionState();
 			return input;
 		}
 
@@ -799,16 +827,23 @@ export class PredictionTimeline {
 		ReadLoop: while (this.expected.length && reader.remaining > 0) {
 			emitPredictionOmitted();
 
-			const prediction = this.expected[0].p;
-			const cursor = this.getCursor(buffer);
+			const { p: prediction, gen } = this.expected[0];
+			const cursor = this.physicalCursor(buffer);
 			let beforeTestReaderIndex = reader.index;
-			switch (prediction.matches(reader)) {
+			switch (prediction.matches(reader, this.lookBehind)) {
 				case MatchResult.Success:
 					// if the input character matches what the next prediction expected, undo
 					// the prediction and write the real character out.
 					const eaten = input.slice(beforeTestReaderIndex, reader.index);
-					output += prediction.rollForwards?.(cursor, eaten);
+					if (gen === startingGen) {
+						output += prediction.rollForwards?.(cursor, eaten);
+					} else {
+						prediction.apply(buffer, this.physicalCursor(buffer)); // move cursor for additional apply
+						output += eaten;
+					}
+
 					this.succeededEmitter.fire(prediction);
+					this.lookBehind = prediction;
 					this.expected.shift();
 					break;
 				case MatchResult.Buffer:
@@ -821,14 +856,13 @@ export class PredictionTimeline {
 					// on a failure, roll back all remaining items in this generation
 					// and clear predictions, since they are no longer valid
 					const rollback = this.expected.filter(p => p.gen === startingGen).reverse();
-					output += rollback.map(({ p }) => p.rollback(this.getCursor(buffer))).join('');
+					output += rollback.map(({ p }) => p.rollback(this.physicalCursor(buffer))).join('');
 					if (rollback.some(r => r.p.affectsStyle)) {
 						// reading the current style should generally be safe, since predictions
 						// always restore the style if they modify it.
 						output += attributesToSeq(core(this.terminal)._inputHandler._curAttrData);
 					}
-					this.expected = [];
-					this.cursor = undefined;
+					this.clearPredictionState();
 					this.failedEmitter.fire(prediction);
 					break ReadLoop;
 			}
@@ -840,8 +874,7 @@ export class PredictionTimeline {
 		// reset the cursor
 		if (!reader.eof) {
 			output += reader.rest;
-			this.expected = [];
-			this.cursor = undefined;
+			this.clearPredictionState();
 		}
 
 		// If we passed a generation boundary, apply the current generation's predictions
@@ -854,7 +887,7 @@ export class PredictionTimeline {
 					this.style.expectIncomingStyle();
 				}
 
-				output += p.apply(buffer, this.getCursor(buffer));
+				output += p.apply(buffer, this.physicalCursor(buffer));
 			}
 		}
 
@@ -866,8 +899,8 @@ export class PredictionTimeline {
 			return output;
 		}
 
-		if (this.cursor) {
-			output += this.cursor.moveInstruction();
+		if (this._physicalCursor) {
+			output += this._physicalCursor.moveInstruction();
 		}
 
 		// prevent cursor flickering while typing
@@ -877,26 +910,39 @@ export class PredictionTimeline {
 	}
 
 	/**
+	 * Clears any expected predictions and stored state. Should be called when
+	 * the pty gives us something we don't recognize.
+	 */
+	private clearPredictionState() {
+		this.expected = [];
+		this.clearCursor();
+		this.lookBehind = undefined;
+	}
+
+	/**
 	 * Appends a typeahead prediction.
 	 */
 	public addPrediction(buffer: IBuffer, prediction: IPrediction) {
 		this.expected.push({ gen: this.currentGen, p: prediction });
 		this.addedEmitter.fire(prediction);
 
-		if (this.currentGen === this.expected[0].gen) {
-			const text = prediction.apply(buffer, this.getCursor(buffer));
-			if (this.showPredictions && text) {
-				if (prediction.affectsStyle) {
-					this.style.expectIncomingStyle();
-				}
-				// console.log('predict:', JSON.stringify(text));
-				this.terminal.write(text);
-			}
-
-			return true;
+		if (this.currentGen !== this.expected[0].gen) {
+			prediction.apply(buffer, this.tentativeCursor(buffer));
+			return false;
 		}
 
-		return false;
+		const text = prediction.apply(buffer, this.physicalCursor(buffer));
+		this._tenativeCursor = undefined; // next read will get or clone the physical cursor
+
+		if (this.showPredictions && text) {
+			if (prediction.affectsStyle) {
+				this.style.expectIncomingStyle();
+			}
+			// console.log('predict:', JSON.stringify(text));
+			this.terminal.write(text);
+		}
+
+		return true;
 	}
 
 	/**
@@ -905,41 +951,63 @@ export class PredictionTimeline {
 	 * pty output/
 	 */
 	public addBoundary(): void;
-	public addBoundary(buffer: IBuffer, prediction: IPrediction): void;
+	public addBoundary(buffer: IBuffer, prediction: IPrediction): boolean;
 	public addBoundary(buffer?: IBuffer, prediction?: IPrediction) {
+		let applied = false;
 		if (buffer && prediction) {
-			this.addPrediction(buffer, prediction);
+			// We apply the prediction so that it's matched against, but wrapped
+			// in a tentativeboundary so that it doesn't affect the physical cursor.
+			// Then we apply it specifically to the tentative cursor.
+			applied = this.addPrediction(buffer, new TentativeBoundary(prediction));
+			prediction.apply(buffer, this.tentativeCursor(buffer));
 		}
 		this.currentGen++;
+		return applied;
 	}
 
 	/**
 	 * Peeks the last prediction written.
 	 */
-	public peekEnd() {
+	public peekEnd(): IPrediction | undefined {
 		return this.expected[this.expected.length - 1]?.p;
 	}
 
 	/**
 	 * Peeks the first pending prediction.
 	 */
-	public peekStart() {
+	public peekStart(): IPrediction | undefined {
 		return this.expected[0]?.p;
 	}
 
-	public getCursor(buffer: IBuffer) {
-		if (!this.cursor) {
+	/**
+	 * Current position of the cursor in the terminal.
+	 */
+	public physicalCursor(buffer: IBuffer) {
+		if (!this._physicalCursor) {
 			if (this.showPredictions) {
 				flushOutput(this.terminal);
 			}
-			this.cursor = new Cursor(this.terminal.rows, this.terminal.cols, buffer);
+			this._physicalCursor = new Cursor(this.terminal.rows, this.terminal.cols, buffer);
 		}
 
-		return this.cursor;
+		return this._physicalCursor;
+	}
+
+	/**
+	 * Cursor position if all predictions and boundaries that have been inserted
+	 * so far turn out to be successfully predicted.
+	 */
+	public tentativeCursor(buffer: IBuffer) {
+		if (!this._tenativeCursor) {
+			this._tenativeCursor = this.physicalCursor(buffer).clone();
+		}
+
+		return this._tenativeCursor;
 	}
 
 	public clearCursor() {
-		this.cursor = undefined;
+		this._physicalCursor = undefined;
+		this._tenativeCursor = undefined;
 	}
 
 	private getActiveBuffer() {
@@ -1182,11 +1250,20 @@ class TypeAheadStyle implements IDisposable {
 const compileExcludeRegexp = (programs = DEFAULT_LOCAL_ECHO_EXCLUDE) =>
 	new RegExp(`\\b(${programs.map(escapeRegExpCharacters).join('|')})\\b`, 'i');
 
+export const enum CharPredictState {
+	/** No characters typed on this line yet */
+	Unknown,
+	/** Has a pending character prediction */
+	HasPendingChar,
+	/** Character validated on this line */
+	Validated,
+}
+
 export class TypeAheadAddon extends Disposable implements ITerminalAddon {
 	private typeaheadStyle?: TypeAheadStyle;
 	private typeaheadThreshold = this.config.config.localEchoLatencyThreshold;
 	private excludeProgramRe = compileExcludeRegexp(this.config.config.localEchoExcludePrograms);
-	protected lastRow?: { y: number; startingX: number };
+	protected lastRow?: { y: number; startingX: number; endingX: number; charState: CharPredictState };
 	protected timeline?: PredictionTimeline;
 	private terminalTitle = '';
 	public stats?: PredictionStats;
@@ -1197,7 +1274,7 @@ export class TypeAheadAddon extends Disposable implements ITerminalAddon {
 	private clearPredictionDebounce?: IDisposable;
 
 	constructor(
-		private readonly processManager: ITerminalProcessManager,
+		private processManager: ITerminalProcessManager,
 		private readonly config: TerminalConfigHelper,
 		@ITelemetryService private readonly telemetryService: ITelemetryService,
 	) {
@@ -1227,6 +1304,13 @@ export class TypeAheadAddon extends Disposable implements ITerminalAddon {
 			this.excludeProgramRe = compileExcludeRegexp(this.config.config.localEchoExcludePrograms);
 			this.reevaluatePredictorState(stats, timeline);
 		}));
+		this._register(this.timeline.onPredictionSucceeded(p => {
+			if (this.lastRow?.charState === CharPredictState.HasPendingChar && isTenativeCharacterPrediction(p) && p.inner.appliedAt) {
+				if (p.inner.appliedAt.pos.y + p.inner.appliedAt.pos.baseY === this.lastRow.y) {
+					this.lastRow.charState = CharPredictState.Validated;
+				}
+			}
+		}));
 		this._register(this.processManager.onBeforeProcessData(e => this.onBeforeProcessData(e)));
 
 		let nextStatsSend: any;
@@ -1246,19 +1330,30 @@ export class TypeAheadAddon extends Disposable implements ITerminalAddon {
 		}));
 	}
 
+	public reset(processManager: ITerminalProcessManager) {
+		this.lastRow = undefined;
+		this.processManager = processManager;
+		this._register(this.processManager.onBeforeProcessData(e => this.onBeforeProcessData(e)));
+	}
+
 	private deferClearingPredictions() {
 		if (!this.stats || !this.timeline) {
 			return;
 		}
 
 		this.clearPredictionDebounce?.dispose();
-		if (this.timeline.length === 0 || this.timeline.peekStart().clearAfterTimeout === false) {
+		if (this.timeline.length === 0 || this.timeline.peekStart()?.clearAfterTimeout === false) {
 			this.clearPredictionDebounce = undefined;
 			return;
 		}
 
 		this.clearPredictionDebounce = disposableTimeout(
-			() => this.timeline?.undoAllPredictions(),
+			() => {
+				this.timeline?.undoAllPredictions();
+				if (this.lastRow?.charState === CharPredictState.HasPendingChar) {
+					this.lastRow.charState = CharPredictState.Unknown;
+				}
+			},
 			Math.max(500, this.stats.maxLatency * 3 / 2),
 		);
 	}
@@ -1331,14 +1426,20 @@ export class TypeAheadAddon extends Disposable implements ITerminalAddon {
 		// the user gave input, and mark all additions before that as tentative.
 		const actualY = buffer.baseY + buffer.cursorY;
 		if (actualY !== this.lastRow?.y) {
-			this.lastRow = { y: actualY, startingX: buffer.cursorX };
+			this.lastRow = { y: actualY, startingX: buffer.cursorX, endingX: buffer.cursorX, charState: CharPredictState.Unknown };
 		} else {
 			this.lastRow.startingX = Math.min(this.lastRow.startingX, buffer.cursorX);
+			this.lastRow.endingX = Math.max(this.lastRow.endingX, this.timeline.physicalCursor(buffer).x);
 		}
 
 		const addLeftNavigating = (p: IPrediction) =>
-			this.timeline!.getCursor(buffer).x <= this.lastRow!.startingX
-				? this.timeline!.addBoundary(buffer, new TentativeBoundary(p))
+			this.timeline!.tentativeCursor(buffer).x <= this.lastRow!.startingX
+				? this.timeline!.addBoundary(buffer, p)
+				: this.timeline!.addPrediction(buffer, p);
+
+		const addRightNavigating = (p: IPrediction) =>
+			this.timeline!.tentativeCursor(buffer).x >= this.lastRow!.endingX - 1
+				? this.timeline!.addBoundary(buffer, p)
 				: this.timeline!.addPrediction(buffer, p);
 
 		/** @see https://github.com/xtermjs/xterm.js/blob/1913e9512c048e3cf56bb5f5df51bfff6899c184/src/common/input/Keyboard.ts */
@@ -1356,14 +1457,29 @@ export class TypeAheadAddon extends Disposable implements ITerminalAddon {
 					flushOutput(this.timeline.terminal);
 				}
 
-				addLeftNavigating(new BackspacePrediction(this.timeline.terminal));
+				if (this.timeline.tentativeCursor(buffer).x <= this.lastRow!.startingX) {
+					this.timeline.addBoundary(buffer, new BackspacePrediction(this.timeline.terminal));
+				} else {
+					// Backspace decrements our ability to go right.
+					this.lastRow.endingX--;
+					this.timeline!.addPrediction(buffer, new BackspacePrediction(this.timeline.terminal));
+				}
+
 				continue;
 			}
 
 			if (reader.eatCharCode(32, 126)) { // alphanum
 				const char = data[reader.index - 1];
-				if (this.timeline.addPrediction(buffer, new CharacterPrediction(this.typeaheadStyle!, char)) && this.timeline.getCursor(buffer).x >= terminal.cols) {
-					this.timeline.addBoundary(buffer, new TentativeBoundary(new LinewrapPrediction()));
+				const prediction = new CharacterPrediction(this.typeaheadStyle!, char);
+				if (this.lastRow.charState === CharPredictState.Unknown) {
+					this.timeline.addBoundary(buffer, prediction);
+					this.lastRow.charState = CharPredictState.HasPendingChar;
+				} else {
+					this.timeline.addPrediction(buffer, prediction);
+				}
+
+				if (this.timeline.tentativeCursor(buffer).x >= terminal.cols) {
+					this.timeline.addBoundary(buffer, new LinewrapPrediction());
 				}
 				continue;
 			}
@@ -1375,13 +1491,13 @@ export class TypeAheadAddon extends Disposable implements ITerminalAddon {
 				if (direction === CursorMoveDirection.Back) {
 					addLeftNavigating(p);
 				} else {
-					this.timeline.addPrediction(buffer, p);
+					addRightNavigating(p);
 				}
 				continue;
 			}
 
 			if (reader.eatStr(`${ESC}f`)) {
-				this.timeline.addPrediction(buffer, new CursorMovePrediction(CursorMoveDirection.Forwards, true, 1));
+				addRightNavigating(new CursorMovePrediction(CursorMoveDirection.Forwards, true, 1));
 				continue;
 			}
 
@@ -1414,14 +1530,6 @@ export class TypeAheadAddon extends Disposable implements ITerminalAddon {
 		// console.log('incoming data:', JSON.stringify(event.data));
 		event.data = this.timeline.beforeServerInput(event.data);
 		// console.log('emitted data:', JSON.stringify(event.data));
-
-		// If there's something that looks like a password prompt, omit giving
-		// input. This is approximate since there's no TTY "password here" code,
-		// but should be enough to cover common cases like sudo
-		if (PASSWORD_INPUT_RE.test(event.data)) {
-			const terminal = this.timeline.terminal;
-			this.timeline.addBoundary(terminal.buffer.active, new HardBoundary());
-		}
 
 		this.deferClearingPredictions();
 	}

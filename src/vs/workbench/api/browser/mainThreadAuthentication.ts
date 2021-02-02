@@ -18,11 +18,8 @@ import { IRemoteAgentService } from 'vs/workbench/services/remote/common/remoteA
 import { fromNow } from 'vs/base/common/date';
 import { ActivationKind, IExtensionService } from 'vs/workbench/services/extensions/common/extensions';
 import { isWeb } from 'vs/base/common/platform';
-import { IEncryptionService } from 'vs/workbench/services/encryption/common/encryptionService';
-import { IProductService } from 'vs/platform/product/common/productService';
-import { ICredentialsService } from 'vs/workbench/services/credentials/common/credentials';
 
-const VSO_ALLOWED_EXTENSIONS = ['github.vscode-pull-request-github', 'github.vscode-pull-request-github-insiders', 'vscode.git', 'ms-vsonline.vsonline', 'vscode.github-browser', 'ms-vscode.github-browser'];
+const VSO_ALLOWED_EXTENSIONS = ['github.vscode-pull-request-github', 'github.vscode-pull-request-github-insiders', 'vscode.git', 'ms-vsonline.vsonline', 'vscode.github-browser', 'ms-vscode.github-browser', 'github.codespaces'];
 
 interface IAccountUsage {
 	extensionId: string;
@@ -69,7 +66,7 @@ function addAccountUsage(storageService: IStorageService, providerId: string, ac
 		});
 	}
 
-	storageService.store(accountKey, JSON.stringify(usages), StorageScope.GLOBAL);
+	storageService.store(accountKey, JSON.stringify(usages), StorageScope.GLOBAL, StorageTarget.MACHINE);
 }
 
 export class MainThreadAuthenticationProvider extends Disposable {
@@ -126,7 +123,7 @@ export class MainThreadAuthenticationProvider extends Disposable {
 
 		quickPick.onDidAccept(() => {
 			const updatedAllowedList = quickPick.selectedItems.map(item => item.extension);
-			this.storageService.store2(`${this.id}-${accountName}`, JSON.stringify(updatedAllowedList), StorageScope.GLOBAL, StorageTarget.USER);
+			this.storageService.store(`${this.id}-${accountName}`, JSON.stringify(updatedAllowedList), StorageScope.GLOBAL, StorageTarget.USER);
 
 			quickPick.dispose();
 		});
@@ -225,10 +222,7 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 		@INotificationService private readonly notificationService: INotificationService,
 		@IRemoteAgentService private readonly remoteAgentService: IRemoteAgentService,
 		@IQuickInputService private readonly quickInputService: IQuickInputService,
-		@IExtensionService private readonly extensionService: IExtensionService,
-		@ICredentialsService private readonly credentialsService: ICredentialsService,
-		@IEncryptionService private readonly encryptionService: IEncryptionService,
-		@IProductService private readonly productService: IProductService
+		@IExtensionService private readonly extensionService: IExtensionService
 	) {
 		super();
 		this._proxy = extHostContext.getProxy(ExtHostContext.ExtHostAuthentication);
@@ -249,10 +243,6 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 
 		this._register(this.authenticationService.onDidChangeDeclaredProviders(e => {
 			this._proxy.$setProviders(e);
-		}));
-
-		this._register(this.credentialsService.onDidChangePassword(_ => {
-			this._proxy.$onDidChangePassword();
 		}));
 	}
 
@@ -385,10 +375,10 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 				const allowList = readAllowedExtensions(this.storageService, providerId, accountName);
 				if (!allowList.find(allowed => allowed.id === extensionId)) {
 					allowList.push({ id: extensionId, name: extensionName });
-					this.storageService.store2(`${providerId}-${accountName}`, JSON.stringify(allowList), StorageScope.GLOBAL, StorageTarget.USER);
+					this.storageService.store(`${providerId}-${accountName}`, JSON.stringify(allowList), StorageScope.GLOBAL, StorageTarget.USER);
 				}
 
-				this.storageService.store(`${extensionName}-${providerId}`, session.id, StorageScope.GLOBAL);
+				this.storageService.store(`${extensionName}-${providerId}`, session.id, StorageScope.GLOBAL, StorageTarget.MACHINE);
 
 				quickPick.dispose();
 				resolve(session);
@@ -416,7 +406,7 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 
 		const remoteConnection = this.remoteAgentService.getConnection();
 		const isVSO = remoteConnection !== null
-			? remoteConnection.remoteAuthority.startsWith('vsonline')
+			? remoteConnection.remoteAuthority.startsWith('vsonline') || remoteConnection.remoteAuthority.startsWith('codespaces')
 			: isWeb;
 
 		if (isVSO && VSO_ALLOWED_EXTENSIONS.includes(extensionId)) {
@@ -437,7 +427,7 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 		if (allow) {
 			addAccountUsage(this.storageService, providerId, accountName, extensionId, extensionName);
 			allowList.push({ id: extensionId, name: extensionName });
-			this.storageService.store2(`${providerId}-${accountName}`, JSON.stringify(allowList), StorageScope.GLOBAL, StorageTarget.USER);
+			this.storageService.store(`${providerId}-${accountName}`, JSON.stringify(allowList), StorageScope.GLOBAL, StorageTarget.USER);
 		}
 
 		return allow;
@@ -460,52 +450,10 @@ export class MainThreadAuthentication extends Disposable implements MainThreadAu
 		const allowList = readAllowedExtensions(this.storageService, providerId, accountName);
 		if (!allowList.find(allowed => allowed.id === extensionId)) {
 			allowList.push({ id: extensionId, name: extensionName });
-			this.storageService.store2(`${providerId}-${accountName}`, JSON.stringify(allowList), StorageScope.GLOBAL, StorageTarget.USER);
+			this.storageService.store(`${providerId}-${accountName}`, JSON.stringify(allowList), StorageScope.GLOBAL, StorageTarget.USER);
 		}
 
-		this.storageService.store(`${extensionName}-${providerId}`, sessionId, StorageScope.GLOBAL);
+		this.storageService.store(`${extensionName}-${providerId}`, sessionId, StorageScope.GLOBAL, StorageTarget.MACHINE);
 		addAccountUsage(this.storageService, providerId, accountName, extensionId, extensionName);
-	}
-
-	private getFullKey(extensionId: string): string {
-		return `${this.productService.urlProtocol}${extensionId}`;
-	}
-
-	async $getPassword(extensionId: string, key: string): Promise<string | undefined> {
-		const fullKey = this.getFullKey(extensionId);
-		const password = await this.credentialsService.getPassword(fullKey, key);
-		const decrypted = password && await this.encryptionService.decrypt(password);
-
-		if (decrypted) {
-			try {
-				const value = JSON.parse(decrypted);
-				if (value.extensionId === extensionId) {
-					return value.content;
-				}
-			} catch (_) {
-				throw new Error('Cannot get password');
-			}
-		}
-
-		return undefined;
-	}
-
-	async $setPassword(extensionId: string, key: string, value: string): Promise<void> {
-		const fullKey = this.getFullKey(extensionId);
-		const toEncrypt = JSON.stringify({
-			extensionId,
-			content: value
-		});
-		const encrypted = await this.encryptionService.encrypt(toEncrypt);
-		return this.credentialsService.setPassword(fullKey, key, encrypted);
-	}
-
-	async $deletePassword(extensionId: string, key: string): Promise<void> {
-		try {
-			const fullKey = this.getFullKey(extensionId);
-			await this.credentialsService.deletePassword(fullKey, key);
-		} catch (_) {
-			throw new Error('Cannot delete password');
-		}
 	}
 }

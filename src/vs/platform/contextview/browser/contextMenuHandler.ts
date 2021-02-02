@@ -80,7 +80,7 @@ export class ContextMenuHandler {
 				const menuDisposables = new DisposableStore();
 
 				const actionRunner = delegate.actionRunner || new ActionRunner();
-				actionRunner.onDidBeforeRun(this.onActionRun, this, menuDisposables);
+				actionRunner.onBeforeRun(this.onActionRun, this, menuDisposables);
 				actionRunner.onDidRun(this.onDidActionRun, this, menuDisposables);
 				menu = new Menu(container, actions, {
 					actionViewItemProvider: delegate.getActionViewItem,
@@ -158,7 +158,7 @@ export class ContextMenuHandler {
 	}
 
 	private onDidActionRun(e: IRunEvent): void {
-		if (e.error && this.notificationService) {
+		if (e.error) {
 			this.notificationService.error(e.error);
 		}
 	}

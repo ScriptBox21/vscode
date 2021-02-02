@@ -29,6 +29,7 @@ import { ResourceMap } from 'vs/base/common/map';
 import { IStorageService, StorageScope, StorageTarget } from 'vs/platform/storage/common/storage';
 import { isStringArray } from 'vs/base/common/types';
 import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
+import { ITextFileService } from 'vs/workbench/services/textfile/common/textfiles';
 
 namespace snippetExt {
 
@@ -160,7 +161,7 @@ class SnippetEnablement {
 			changed = true;
 		}
 		if (changed) {
-			this._storageService.store2(SnippetEnablement._key, JSON.stringify(Array.from(this._ignored)), StorageScope.GLOBAL, StorageTarget.USER);
+			this._storageService.store(SnippetEnablement._key, JSON.stringify(Array.from(this._ignored)), StorageScope.GLOBAL, StorageTarget.USER);
 		}
 	}
 }
@@ -180,6 +181,7 @@ class SnippetsService implements ISnippetsService {
 		@IModeService private readonly _modeService: IModeService,
 		@ILogService private readonly _logService: ILogService,
 		@IFileService private readonly _fileService: IFileService,
+		@ITextFileService private readonly _textfileService: ITextFileService,
 		@IExtensionResourceLoaderService private readonly _extensionResourceLoaderService: IExtensionResourceLoaderService,
 		@ILifecycleService lifecycleService: ILifecycleService,
 		@IInstantiationService instantiationService: IInstantiationService,
@@ -371,6 +373,11 @@ class SnippetsService implements ISnippetsService {
 			}
 		};
 
+		bucket.add(this._textfileService.files.onDidSave(e => {
+			if (resources.isEqualOrParent(e.model.resource, folder)) {
+				addFolderSnippets();
+			}
+		}));
 		bucket.add(watch(this._fileService, folder, addFolderSnippets));
 		bucket.add(disposables);
 		return addFolderSnippets();

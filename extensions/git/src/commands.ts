@@ -3,14 +3,13 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { lstat, Stats } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { commands, Disposable, LineChange, MessageOptions, OutputChannel, Position, ProgressLocation, QuickPickItem, Range, SourceControlResourceState, TextDocumentShowOptions, TextEditor, Uri, ViewColumn, window, workspace, WorkspaceEdit, WorkspaceFolder, TimelineItem, env, Selection, TextDocumentContentProvider } from 'vscode';
 import TelemetryReporter from 'vscode-extension-telemetry';
 import * as nls from 'vscode-nls';
-import { Branch, GitErrorCodes, Ref, RefType, Status, CommitOptions, RemoteSourceProvider } from './api/git';
-import { ForcePushMode, Git, Stash } from './git';
+import { Branch, ForcePushMode, GitErrorCodes, Ref, RefType, Status, CommitOptions, RemoteSourceProvider } from './api/git';
+import { Git, Stash } from './git';
 import { Model } from './model';
 import { Repository, Resource, ResourceGroupType } from './repository';
 import { applyLineChanges, getModifiedRange, intersectDiffWithRange, invertLineChange, toLineRanges } from './staging';
@@ -55,7 +54,7 @@ class CheckoutRemoteHeadItem extends CheckoutItem {
 		return localize('remote branch at', "Remote branch at {0}", this.shortCommit);
 	}
 
-	async run(repository: Repository): Promise<void> {
+	async run(repository: Repository, opts?: { detached?: boolean }): Promise<void> {
 		if (!this.ref.name) {
 			return;
 		}
@@ -63,9 +62,9 @@ class CheckoutRemoteHeadItem extends CheckoutItem {
 		const branches = await repository.findTrackingBranches(this.ref.name);
 
 		if (branches.length > 0) {
-			await repository.checkout(branches[0].name!);
+			await repository.checkout(branches[0].name!, opts);
 		} else {
-			await repository.checkoutTracking(this.ref.name);
+			await repository.checkoutTracking(this.ref.name, opts);
 		}
 	}
 }
@@ -278,6 +277,12 @@ interface PushOptions {
 	pushType: PushType;
 	forcePush?: boolean;
 	silent?: boolean;
+
+	pushTo?: {
+		remote?: string;
+		refspec?: string;
+		setUpstream?: boolean;
+	}
 }
 
 class CommandErrorOutputTextDocumentContentProvider implements TextDocumentContentProvider {
@@ -357,166 +362,31 @@ export class CommandCenter {
 	}
 
 	@command('git.openResource')
-	async openResource(resource: Resource, preserveFocus: boolean): Promise<void> {
+	async openResource(resource: Resource): Promise<void> {
 		const repository = this.model.getRepository(resource.resourceUri);
 
 		if (!repository) {
 			return;
 		}
 
-		const config = workspace.getConfiguration('git', Uri.file(repository.root));
-		const openDiffOnClick = config.get<boolean>('openDiffOnClick');
-
-		if (openDiffOnClick) {
-			await this._openResource(resource, undefined, preserveFocus, false);
-		} else {
-			await this.openFile(resource);
-		}
+		await resource.open();
 	}
 
-	private async _openResource(resource: Resource, preview?: boolean, preserveFocus?: boolean, preserveSelection?: boolean): Promise<void> {
-		let stat: Stats | undefined;
-
-		try {
-			stat = await new Promise<Stats>((c, e) => lstat(resource.resourceUri.fsPath, (err, stat) => err ? e(err) : c(stat)));
-		} catch (err) {
-			// noop
-		}
-
-		let left: Uri | undefined;
-		let right: Uri | undefined;
-
-		if (stat && stat.isDirectory()) {
-			const repository = this.model.getRepositoryForSubmodule(resource.resourceUri);
-
-			if (repository) {
-				right = toGitUri(resource.resourceUri, resource.resourceGroupType === ResourceGroupType.Index ? 'index' : 'wt', { submoduleOf: repository.root });
-			}
-		} else {
-			if (resource.type === Status.DELETED_BY_US || resource.type === Status.DELETED_BY_THEM) {
-				left = toGitUri(resource.resourceUri, '~1');
-			} else {
-				left = this.getLeftResource(resource);
+	@command('git.openAllChanges', { repository: true })
+	async openChanges(repository: Repository): Promise<void> {
+		for (const resource of [...repository.workingTreeGroup.resourceStates, ...repository.untrackedGroup.resourceStates]) {
+			if (
+				resource.type === Status.DELETED || resource.type === Status.DELETED_BY_THEM ||
+				resource.type === Status.DELETED_BY_US || resource.type === Status.BOTH_DELETED
+			) {
+				continue;
 			}
 
-			right = this.getRightResource(resource);
-		}
-
-		const title = this.getTitle(resource);
-
-		if (!right) {
-			// TODO
-			console.error('oh no');
-			return;
-		}
-
-		const opts: TextDocumentShowOptions = {
-			preserveFocus,
-			preview,
-			viewColumn: ViewColumn.Active
-		};
-
-		const activeTextEditor = window.activeTextEditor;
-
-		// Check if active text editor has same path as other editor. we cannot compare via
-		// URI.toString() here because the schemas can be different. Instead we just go by path.
-		if (preserveSelection && activeTextEditor && activeTextEditor.document.uri.path === right.path) {
-			opts.selection = activeTextEditor.selection;
-		}
-
-		if (!left) {
-			await commands.executeCommand<void>('vscode.open', right, { ...opts, override: resource.type === Status.BOTH_MODIFIED ? false : undefined }, title);
-		} else {
-			await commands.executeCommand<void>('vscode.diff', left, right, title, opts);
-		}
-	}
-
-	private getLeftResource(resource: Resource): Uri | undefined {
-		switch (resource.type) {
-			case Status.INDEX_MODIFIED:
-			case Status.INDEX_RENAMED:
-			case Status.INDEX_ADDED:
-				return toGitUri(resource.original, 'HEAD');
-
-			case Status.MODIFIED:
-			case Status.UNTRACKED:
-				return toGitUri(resource.resourceUri, '~');
-
-			case Status.DELETED_BY_THEM:
-				return toGitUri(resource.resourceUri, '');
-		}
-		return undefined;
-	}
-
-	private getRightResource(resource: Resource): Uri | undefined {
-		switch (resource.type) {
-			case Status.INDEX_MODIFIED:
-			case Status.INDEX_ADDED:
-			case Status.INDEX_COPIED:
-			case Status.INDEX_RENAMED:
-				return toGitUri(resource.resourceUri, '');
-
-			case Status.INDEX_DELETED:
-			case Status.DELETED:
-				return toGitUri(resource.resourceUri, 'HEAD');
-
-			case Status.DELETED_BY_US:
-				return toGitUri(resource.resourceUri, '~3');
-
-			case Status.DELETED_BY_THEM:
-				return toGitUri(resource.resourceUri, '~2');
-
-			case Status.MODIFIED:
-			case Status.UNTRACKED:
-			case Status.IGNORED:
-			case Status.INTENT_TO_ADD:
-				const repository = this.model.getRepository(resource.resourceUri);
-
-				if (!repository) {
-					return;
-				}
-
-				const uriString = resource.resourceUri.toString();
-				const [indexStatus] = repository.indexGroup.resourceStates.filter(r => r.resourceUri.toString() === uriString);
-
-				if (indexStatus && indexStatus.renameResourceUri) {
-					return indexStatus.renameResourceUri;
-				}
-
-				return resource.resourceUri;
-
-			case Status.BOTH_ADDED:
-			case Status.BOTH_MODIFIED:
-				return resource.resourceUri;
-		}
-		return undefined;
-	}
-
-	private getTitle(resource: Resource): string {
-		const basename = path.basename(resource.resourceUri.fsPath);
-
-		switch (resource.type) {
-			case Status.INDEX_MODIFIED:
-			case Status.INDEX_RENAMED:
-			case Status.INDEX_ADDED:
-				return localize('git.title.index', '{0} (Index)', basename);
-
-			case Status.MODIFIED:
-			case Status.BOTH_ADDED:
-			case Status.BOTH_MODIFIED:
-				return localize('git.title.workingTree', '{0} (Working Tree)', basename);
-
-			case Status.DELETED_BY_US:
-				return localize('git.title.theirs', '{0} (Theirs)', basename);
-
-			case Status.DELETED_BY_THEM:
-				return localize('git.title.ours', '{0} (Ours)', basename);
-
-			case Status.UNTRACKED:
-				return localize('git.title.untracked', '{0} (Untracked)', basename);
-
-			default:
-				return '';
+			void commands.executeCommand(
+				'vscode.open',
+				resource.resourceUri,
+				{ background: true, preview: false, }
+			);
 		}
 	}
 
@@ -654,12 +524,12 @@ export class CommandCenter {
 
 	@command('git.clone')
 	async clone(url?: string, parentPath?: string): Promise<void> {
-		this.cloneRepository(url, parentPath);
+		await this.cloneRepository(url, parentPath);
 	}
 
 	@command('git.cloneRecursive')
 	async cloneRecursive(url?: string, parentPath?: string): Promise<void> {
-		this.cloneRepository(url, parentPath, { recursive: true });
+		await this.cloneRepository(url, parentPath, { recursive: true });
 	}
 
 	@command('git.init')
@@ -871,7 +741,7 @@ export class CommandCenter {
 			return;
 		}
 
-		const HEAD = this.getLeftResource(resource);
+		const HEAD = resource.leftUri;
 		const basename = path.basename(resource.resourceUri.fsPath);
 		const title = `${basename} (HEAD)`;
 
@@ -889,10 +759,6 @@ export class CommandCenter {
 
 	@command('git.openChange')
 	async openChange(arg?: Resource | Uri, ...resourceStates: SourceControlResourceState[]): Promise<void> {
-		const preserveFocus = arg instanceof Resource;
-		const preview = !(arg instanceof Resource);
-
-		const preserveSelection = arg instanceof Uri || !arg;
 		let resources: Resource[] | undefined = undefined;
 
 		if (arg instanceof Uri) {
@@ -919,12 +785,14 @@ export class CommandCenter {
 		}
 
 		for (const resource of resources) {
-			await this._openResource(resource, preview, preserveFocus, preserveSelection);
+			await resource.openChange();
 		}
 	}
 
 	@command('git.rename', { repository: true })
-	async rename(repository: Repository, fromUri: Uri): Promise<void> {
+	async rename(repository: Repository, fromUri: Uri | undefined): Promise<void> {
+		fromUri = fromUri ?? window.activeTextEditor?.document.uri;
+
 		if (!fromUri) {
 			return;
 		}
@@ -1109,6 +977,10 @@ export class CommandCenter {
 
 	@command('git.stageChange')
 	async stageChange(uri: Uri, changes: LineChange[], index: number): Promise<void> {
+		if (!uri) {
+			return;
+		}
+
 		const textEditor = window.visibleTextEditors.filter(e => e.document.uri.toString() === uri.toString())[0];
 
 		if (!textEditor) {
@@ -1159,6 +1031,10 @@ export class CommandCenter {
 
 	@command('git.revertChange')
 	async revertChange(uri: Uri, changes: LineChange[], index: number): Promise<void> {
+		if (!uri) {
+			return;
+		}
+
 		const textEditor = window.visibleTextEditors.filter(e => e.document.uri.toString() === uri.toString())[0];
 
 		if (!textEditor) {
@@ -1471,8 +1347,8 @@ export class CommandCenter {
 
 		const enableSmartCommit = config.get<boolean>('enableSmartCommit') === true;
 		const enableCommitSigning = config.get<boolean>('enableCommitSigning') === true;
-		const noStagedChanges = repository.indexGroup.resourceStates.length === 0;
-		const noUnstagedChanges = repository.workingTreeGroup.resourceStates.length === 0;
+		let noStagedChanges = repository.indexGroup.resourceStates.length === 0;
+		let noUnstagedChanges = repository.workingTreeGroup.resourceStates.length === 0;
 
 		if (promptToSaveFilesBeforeCommit !== 'never') {
 			let documents = workspace.textDocuments
@@ -1494,6 +1370,9 @@ export class CommandCenter {
 				if (pick === saveAndCommit) {
 					await Promise.all(documents.map(d => d.save()));
 					await repository.add(documents.map(d => d.uri));
+
+					noStagedChanges = repository.indexGroup.resourceStates.length === 0;
+					noUnstagedChanges = repository.workingTreeGroup.resourceStates.length === 0;
 				} else if (pick !== commit) {
 					return false; // do not commit on cancel
 				}
@@ -1989,8 +1868,8 @@ export class CommandCenter {
 	@command('git.merge', { repository: true })
 	async merge(repository: Repository): Promise<void> {
 		const config = workspace.getConfiguration('git');
-		const checkoutType = config.get<string>('checkoutType') || 'all';
-		const includeRemotes = checkoutType === 'all' || checkoutType === 'remote';
+		const checkoutType = config.get<string | string[]>('checkoutType');
+		const includeRemotes = checkoutType === 'all' || checkoutType === 'remote' || checkoutType?.includes('remote');
 
 		const heads = repository.refs.filter(ref => ref.type === RefType.Head)
 			.filter(ref => ref.name || ref.commit)
@@ -2014,8 +1893,8 @@ export class CommandCenter {
 	@command('git.rebase', { repository: true })
 	async rebase(repository: Repository): Promise<void> {
 		const config = workspace.getConfiguration('git');
-		const checkoutType = config.get<string>('checkoutType') || 'all';
-		const includeRemotes = checkoutType === 'all' || checkoutType === 'remote';
+		const checkoutType = config.get<string | string[]>('checkoutType');
+		const includeRemotes = checkoutType === 'all' || checkoutType === 'remote' || checkoutType?.includes('remote');
 
 		const heads = repository.refs.filter(ref => ref.type === RefType.Head)
 			.filter(ref => ref.name !== repository.HEAD?.name)
@@ -2260,23 +2139,27 @@ export class CommandCenter {
 			}
 		} else {
 			const branchName = repository.HEAD.name;
-			const addRemote = new AddRemoteItem(this);
-			const picks = [...remotes.filter(r => r.pushUrl !== undefined).map(r => ({ label: r.name, description: r.pushUrl })), addRemote];
-			const placeHolder = localize('pick remote', "Pick a remote to publish the branch '{0}' to:", branchName);
-			const choice = await window.showQuickPick(picks, { placeHolder });
+			if (!pushOptions.pushTo?.remote) {
+				const addRemote = new AddRemoteItem(this);
+				const picks = [...remotes.filter(r => r.pushUrl !== undefined).map(r => ({ label: r.name, description: r.pushUrl })), addRemote];
+				const placeHolder = localize('pick remote', "Pick a remote to publish the branch '{0}' to:", branchName);
+				const choice = await window.showQuickPick(picks, { placeHolder });
 
-			if (!choice) {
-				return;
-			}
+				if (!choice) {
+					return;
+				}
 
-			if (choice === addRemote) {
-				const newRemote = await this.addRemote(repository);
+				if (choice === addRemote) {
+					const newRemote = await this.addRemote(repository);
 
-				if (newRemote) {
-					await repository.pushTo(newRemote, branchName, undefined, forcePushMode);
+					if (newRemote) {
+						await repository.pushTo(newRemote, branchName, undefined, forcePushMode);
+					}
+				} else {
+					await repository.pushTo(choice.label, branchName, undefined, forcePushMode);
 				}
 			} else {
-				await repository.pushTo(choice.label, branchName, undefined, forcePushMode);
+				await repository.pushTo(pushOptions.pushTo.remote, pushOptions.pushTo.refspec || branchName, pushOptions.pushTo.setUpstream, forcePushMode);
 			}
 		}
 	}
@@ -2317,13 +2200,13 @@ export class CommandCenter {
 	}
 
 	@command('git.pushTo', { repository: true })
-	async pushTo(repository: Repository): Promise<void> {
-		await this._push(repository, { pushType: PushType.PushTo });
+	async pushTo(repository: Repository, remote?: string, refspec?: string, setUpstream?: boolean): Promise<void> {
+		await this._push(repository, { pushType: PushType.PushTo, pushTo: { remote: remote, refspec: refspec, setUpstream: setUpstream } });
 	}
 
 	@command('git.pushToForce', { repository: true })
-	async pushToForce(repository: Repository): Promise<void> {
-		await this._push(repository, { pushType: PushType.PushTo, forcePush: true });
+	async pushToForce(repository: Repository, remote?: string, refspec?: string, setUpstream?: boolean): Promise<void> {
+		await this._push(repository, { pushType: PushType.PushTo, pushTo: { remote: remote, refspec: refspec, setUpstream: setUpstream }, forcePush: true });
 	}
 
 	@command('git.pushTags', { repository: true })
@@ -2503,11 +2386,16 @@ export class CommandCenter {
 			}
 
 			await provider.publishRepository!(new ApiRepository(repository));
+			this.model.firePublishEvent(repository, branchName);
+
 			return;
 		}
 
 		if (remotes.length === 1) {
-			return await repository.pushTo(remotes[0].name, branchName, true);
+			await repository.pushTo(remotes[0].name, branchName, true);
+			this.model.firePublishEvent(repository, branchName);
+
+			return;
 		}
 
 		const addRemote = new AddRemoteItem(this);
@@ -2524,9 +2412,13 @@ export class CommandCenter {
 
 			if (newRemote) {
 				await repository.pushTo(newRemote, branchName, true);
+
+				this.model.firePublishEvent(repository, branchName);
 			}
 		} else {
 			await repository.pushTo(choice.label, branchName, true);
+
+			this.model.firePublishEvent(repository, branchName);
 		}
 	}
 
@@ -2796,7 +2688,7 @@ export class CommandCenter {
 						return Promise.resolve();
 					}
 
-					return Promise.resolve(method.apply(this, [repository, ...args]));
+					return Promise.resolve(method.apply(this, [repository, ...args.slice(1)]));
 				});
 			}
 
